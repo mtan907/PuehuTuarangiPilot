@@ -1,0 +1,588 @@
+---
+title: "Puehu Tuarangi: Dynamic Geomapping of Cancer Care in Northland, New Zealand"
+author: "Mitchell Tan"
+date: "`r Sys.Date()`"
+output: 
+  word_document:
+    fig_caption: YES
+    reference_docx: style-reference-base1.docx
+csl: vancouver-superscript.csl
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = 'C:/Users/munch/Documents/Uni/Year 6/Elective')
+```
+
+## Abstract
+
+Named "Puehu Tuarangi" (Nebulae, in Te Reo Māori), this project proposes a novel approach to health inequity geomapping. Unlike other dynamic geomapping models for health used in Aotearoa/New Zealand and overseas, ours aims to provide up-to-date data, and a resolution that is fine enough to identify and target disadvantaged communities.
+
+#### Aim
+
+The purpose of this proof-of-concept pilot study was to produce a detailed heat map of cancer care utilisation in Te Tai Tokerau/Northland, and to identify and communicate inequities found.
+
+#### Method
+
+Cancer care data was gathered from Northland DHB databases, now in Te Whatu Ora/Health NZ. Information regarding patients tumour streams, treatment modalities, and important dates were retrieved by encrypted National Health Index (NHI) identifiers, and matched to Census Area Units (CAUs). The cleaned-up data was analysed and used to produce geocomputed choropleths, cartograms, and plots utilising the R programming language.
+
+#### Results
+
+A total of 13,243 new cases of cancer were diagnosed in Northland from 2013 to June 2022. Generated funnel plots and geomaps highlighted multiple poorly serviced CAUs according to surgical rates and lag time indicators.
+
+#### Conclusion
+
+Geomapping successfully showed and communicated areas of lower cancer service utilisation in Northland, and was successful as a proof-of-concept. Feasibility for use of a geomapping tool in recognising geographical areas of need was achieved through this study, could form the grounds for further iterations of methods and analysis, ultimately adopted as a potential tool for widespread use.
+
+\newpage
+
+```{r include = FALSE}
+# Packages to load
+library(sf)
+library(dplyr)
+library(spData) 
+library(tmap)
+library(shiny)
+library(shinyjs)
+library(grid)
+library(cartogram)
+library(FunnelPlotR)
+library(ggplot2)
+library(gridExtra)
+library(egg)
+library(viridis)
+library(knitr)
+
+
+setwd('C:/Users/munch/Documents/Uni/Year 6/Elective')
+rm(list = ls())
+Maps  <- list(NULL)
+Plots <- list(NULL)
+Year   <- 2013:2022
+windowsFonts("Calibri" = windowsFont("Calibri"))
+
+
+### Set up the object for reporting data by Area Census Unit and Year. 
+
+# Import Faster Cancer Treatment data for Te Tai Tokerau
+TTdata <- read.csv("./Dataset3aNoSkinNoDups.csv", header=TRUE)
+names(TTdata)
+
+# Add a column for DiagnosisYear
+TTdata$DiagnosisYear <- sapply(TTdata$DateDiagnosed,function(x){
+  Date  <- as.POSIXct(x, format = "%d/%m/%Y")
+  format(Date,format="%Y")
+})
+
+# Add a column testing for Surgery as first treatment
+TTdata$FirstTreatmentSurgery <- TTdata$FirstTreatmentType == "Surgery"
+
+# Relocate working columns to the front
+TTdata   <- TTdata %>% relocate(DiagnosisYear,
+                                DomicileDesc,
+                                AreaCensusUnit,
+                                FirstTreatmentSurgery,
+                                TumourStream,
+                                DeprivationIndex)
+
+# Arrange  rows by year and by Area Census Unit
+TTdata   <- TTdata %>% arrange(DiagnosisYear,
+                               AreaCensusUnit)                               
+
+# Data integrity check: which years are represented in the diagnosis data?
+sort(unique(TTdata$DiagnosisYear),na.last=T)
+# Interestingly, there are no diagnosis dates for 2011!  Also there are only two entries for 2010 and 2012.  Hence Year is set to 2013:2022.
+TTdata[1:5,1:5]
+
+
+# Find unique combinations of Area Census Unit and Domicile Descriptions.
+ACunit       <- (function(){   
+       Code  <- TTdata[,c(2,3)]
+       List  <- Code[!duplicated(t(apply(Code, 1, sort))),]
+       List[order(List[,1]),]
+})()
+
+#Code above seems broken - not removing duplicates. Solved in line below
+ACunit       <- ACunit[!duplicated(ACunit$AreaCensusUnit),]
+
+#Arranging by Area Census Unit
+ACunit       <- ACunit %>% arrange(AreaCensusUnit)                               
+
+# Removing Wellsford and South from the series
+ACunit       <- subset(ACunit,AreaCensusUnit < 505300)
+
+
+# Data integrity check: are any Domicile Descriptions matched to more than one Area Census Unit?
+ACunit[which(duplicated(ACunit$DomicileDesc)),]
+# No duplicates returned. Bream Head discrepancy fixed in the CSV on my version. 
+
+# Summary tables for each AreaCensusUnit.  Showing total diagnoses and total FirstTreatmentSurgery in each DiagnosisYear.
+
+TTlist  <- (function(){
+  List  <- split(TTdata,TTdata$AreaCensusUnit)
+  Summ  <- function(i = List[[33]]) {
+    i %>%
+    group_by(DiagnosisYear) %>%
+    summarise(TotalSurgery = sum(FirstTreatmentSurgery),
+              Diagnoses = length(FirstTreatmentSurgery))
+  } 
+  lapply(List,Summ)
+})()
+  
+# Surgery in each Area Census Unit
+ACunit$Surgery <- sapply(ACunit$AreaCensusUnit,function(i){
+  Index <- which(names(TTlist)==i)
+  sum(TTlist[[Index]]$TotalSurgery)
+})
+
+# Total cases in each Area Census Unit
+ACunit$Cases  <- sapply(ACunit$AreaCensusUnit,function(i){
+  Index <- which(names(TTlist)==i)
+  sum(TTlist[[Index]]$Diagnoses)
+})
+
+# Surgery Performance in each Area Census Unit
+ACunit$SurgPerformance  <- ACunit$Surgery / ACunit$Cases
+
+#Arranging by Performance
+ACunit       <- ACunit %>% arrange(SurgPerformance)
+
+
+## LagFSA.TreatDecn data manipulation - calculating performance of CAUs based on proportion of Lag times Under 31 days in relation to cases.
+
+# Removing data south of Northland and missing data points, placing in copied dataframe TTdata1 for manipulation.
+# This removes 2670 and 1991 data points
+TTdata1 <- subset(TTdata,AreaCensusUnit < 505300)
+TTdata1 <- subset(TTdata1,LagFSA.TreatDecn!="#VALUE!")
+
+
+#Subsetting all Lag times under 1 day and Under 2 years - this removes 15 and 849 data points respectively
+TTdata1 <- subset(TTdata1,LagFSA.TreatDecn > -1)
+TTdata1 <- subset(TTdata1,LagFSA.TreatDecn < 730)
+
+
+#Defining Lag time as numeric value
+TTdata1$LagFSA.TreatDecn <- as.numeric(TTdata1$LagFSA.TreatDecn)
+
+
+#Adding new column LagFTDUnder31 for if Lag Time between FSA and treatment decision is Under 31 day target
+#This is an arbitrary indicator currently - need to check guidelines
+TTdata1$LagFTDUnder31 <- TTdata1$LagFSA.TreatDecn < 32
+
+
+#Summarising by lag time between FSA and treatment decision
+ACunit1 <- TTdata1 %>%
+  group_by(AreaCensusUnit) %>%
+  summarise(Median.LagFSA.TreatDecn = median(LagFSA.TreatDecn),
+            LagUnder31 = sum(LagFTDUnder31))
+
+ACunit1$Median.LagFSA.TreatDecn <- as.integer(ACunit1$Median.LagFSA.TreatDecn)
+
+
+### Adding populations to CAU data
+
+
+# CAU Master sheet found at https://figure.nz/table/uQ6OOVwPunralaft
+CAU13 <- read.csv("./Census_Population_by_sex_by_Area_Unit_2001_2006_2013.csv")
+names (CAU13)
+
+# Stats NZ 2013 census sheet found at https://datafinder.stats.govt.nz/layer/25743-area-unit-2013/
+AreaCodes <- read.csv("./area-unit-2013.csv")
+names (AreaCodes)
+
+
+# Subsetting for 2013 census, Census usually resident population count
+CAU13 <- subset(CAU13,Census.Year > 2012)
+CAU13 <- subset(CAU13,Measure == "Census usually resident population count")
+CAU13 <- subset(CAU13,select = -c(Area.Unit.Code,Census.Year,Measure,Sex,Value.Unit,Value.Label,Null.Reason))
+CAU13 <- subset(CAU13,Value > 0)
+
+
+# Subsetting Area Codes to return just area codes and names
+AreaCodes <- subset(AreaCodes,select = -c(WKT,AREA_SQ_KM,LAND_AREA_SQ_KM,Shape_Length))
+AreaCodes <- AreaCodes %>% arrange(AU2013_V1_00)
+AreaCodes <- subset(AreaCodes,AU2013_V1_00 < 505299)
+
+
+# Creating new Data Frame matching area codes to populations - was missing from original data sheet
+
+AreaCodes   <- rename(AreaCodes,Area.Unit = AU2013_V1_00_NAME)
+
+Populations <- merge(CAU13,AreaCodes,by="Area.Unit")
+Populations <- rename(Populations,Usual.Resident = Value, 
+                      CAU2013.Code = AU2013_V1_00)
+Populations <- Populations %>% relocate(CAU2013.Code,
+                                        Area.Unit,
+                                        Usual.Resident)
+Populations   <- rename(Populations,AreaCensusUnit = CAU2013.Code)
+
+# Merging to FinalTable new dataframe containing population data
+FinalTable <- merge(ACunit,Populations,by = "AreaCensusUnit")
+FinalTable <- merge(FinalTable,ACunit1,by = "AreaCensusUnit")
+FinalTable <- subset(FinalTable, select = -c(Area.Unit))
+
+# Adding Maori count column
+TTdata$Māori <- TTdata$M.nM == "Māori"
+
+
+ACunit2 <- TTdata %>%
+  group_by(AreaCensusUnit) %>%
+  summarise(MāoriCount = sum(Māori))
+
+FinalTable <- merge(FinalTable,ACunit2,by = "AreaCensusUnit")
+
+FinalTable$MāoriRatio <- FinalTable$MāoriCount / FinalTable$Cases
+
+
+#Lag Time Performance Column
+
+FinalTable$LagPerformance <- FinalTable$LagUnder31 / FinalTable$Cases
+
+#Cancer incidence per CAU
+FinalTable$CaseRatio <- FinalTable$Cases / FinalTable$Usual.Resident
+
+FinalTable <- FinalTable %>% relocate(AreaCensusUnit, DomicileDesc,
+                                      Cases, Usual.Resident, CaseRatio, MāoriCount, MāoriRatio,
+                                      Surgery, SurgPerformance,
+                                      Median.LagFSA.TreatDecn, LagUnder31, LagPerformance)
+
+FinalTable <- rename(FinalTable, CAU = AreaCensusUnit, Domicile = DomicileDesc,
+                     Residents = Usual.Resident, MedianLagFSA.DTT = Median.LagFSA.TreatDecn,
+                     LagCaseRatio = LagPerformance, SurgCaseRatio = SurgPerformance)
+
+
+```
+
+## Introduction
+
+Health inequities are well-documented throughout Aotearoa/New Zealand. Despite mounting evidence and implementation effort of various policies, inequity of health access and outcome are a pervasive issue, without a simple fix. Equal access to health care for all continues to underpin modern health policy throughout the country. Addressing inequities is a major objective of recent restructuring of New Zealand's 20 District Health Boards (DHB) into Te Whatu Ora/Health New Zealand (HNZ) and Te Aka Whai Ora/Māori Health Authority (MHA).
+
+Worryingly, the trend in recent health policy appears to have reduced its focus on equity of outcome.[@goodyear-smith2019] Māori, Pacific, and low-income populations continue to be the most disadvantaged populations in the country, with Māori showing particular disparities. 2015 figures from the Ministry of Health show persisting poor outcomes, with mortality amenable to healthcare in Māori more than double that of non-Māori (142.8 per 100,000 v. 59.8).[@yeh2015]
+
+At the start of patient and whānau journeys in the health system, access is also an issue that disproportionately affects Māori, with non-Māori being 1.3x more likely to be able to access GPs when required.[@ministryofhealth2018] A range of factors outside of the health system impact on the delivery of health care across the country, social determinants such as remoteness from population centres, poverty, and homelessness. These wider social determinants affect all population segments, but Māori disproportionately.
+
+Low-income has long been a factor also associated with poorer health outcomes, but is often confounded by other variables.[@goodyear-smith2019] This does not detract from the fact that this relationship does exist and is a problematic one. Despite utilising a universal health system, much of the care in New Zealand is predicated on access to general practitioners (GPs), which necessitates funds with which to afford the mandatory co-payments.[@chin2018] Although funding schemes do exist, such as the Very Low Cost Access (VLCA) scheme, uptake into these programs continues to be prohibitive and poor, with approximately 500,000 high needs patients not enrolled in practices that fall under VLCA jurisdictions.[@love2022] This has flow on effects at the subsidised hospital-level care as well. In colorectal cancer, 43% in the lowest deprivation group had their initial presentation to the emergency department, compared to 29% in the least deprived group.[@jackson2015] Low socio-economic status and ethnicity seem to be intrinsically linked too, with the majority of New Zealand's Māori population residing in the more deprived deciles (NZDep 7-10).[@yeh2015]
+
+A look at cancer care throughout Aotearoa gives a microcosmic glimpse of the wider inequities present. The example of colorectal cancer presentation used above is but one case of such health inequities expressed throughout cancer care. Broadly, Māori have poorer experience and outcomes in regards to cancer care, as in the general health population. This is across multiple indicators of performance, including incidence, mortality, and survival.[@robson2010] Many examples exist in the literature. These range from Māori being less likely to receive chemotherapy and poorer timing for such in colorectal cancers,[@lao2020] to poorer rates of survival in Māori with myelofibrosis, with Māori ethnicity also being identified as an independent risk factor for mortality.[@varghese2021]
+
+As with other health conditions, the social determinants causing this higher rate of cancer within Māori are multi-factorial and complex. Evidence ranges from higher lag times between diagnosis and treatment and poorer access to treatment, to higher risk of living in poverty and higher likelihood of having prior co-morbidities.[@gurney2020] The long-term experience of colonisation offers a unifying underlying historic cause.
+
+Rurality and ethnicity both impact on cancer care within the Northland/Te Tai Tokerau (TTT) region. The Northland population boasts the second highest percentage of Māori (Census 2018: 36%)[@statsnz2018] and highest percentage living outside of urban centres (Census 2013: 49%)[@statsnz2013]in New Zealand. Both of these factors are negative predictors of health outcomes.[@goodyear-smith2019] As discussed earlier, this is at the mercy of social determinants and systemic factors, but the fact remains this inequity exists including for cancer care.
+
+Puehu Tuarangi seeks to provide clinicians, researchers, and policy makers with a tool with which to view the impacts of their implemented policies and interventions in an up-to-date manner. By utilising dynamic geomapping, use of cancer care throughout Te Tai Tokerau is presented in a graphical, visual manner, and discrepancies in equity are visible at a community level. From the Te Reo Māori phrase for nebulae, Puehu Tuarangi is to resemble a heat map, with **areas underutilising cancer care appear dark against the over-utilised, bright areas,** akin to nebulae clouding the stars in the night sky.
+
+There are multiple prior examples of geomapping for health equity both in Aotearoa, and worldwide. The Health Quality and Safety Commission present such data in tableau and graphical form in their [Equity Explorer](https://www.hqsc.govt.nz/our-data/atlas-of-healthcare-variation/equity-explorer/). This allows tracking of healthcare variables such as HbA1c testing, as a proxy measure of diabetes rates. However, these resolve to the DHB level, and do not display variation within the large service areas.[@healthqualitysafetycommission2021]The British National Health Service (NHS) presents a geomapped example in their [Atlases of Variation](https://www.england.nhs.uk/rightcare/products/atlas/). These atlases have similar issues in resolution, only resolving to the level of the clinical commissioning group, covering a population between 120,000 to 2,000,000 individuals, which makes targeted geographical inferences on equity difficult to ascertain.[@nationalhealthservice2021; @officefornationalstatistics2021]
+
+Following proof-of-concept, Puehu Tuarangi ultimately proposes the geomapping of health service utilisation relative to the level of Census 2018 Statistical Areas 1 and 2 (SA1 and SA2 respectively). SA2 contains populations of between 2,000 - 4,000 in city council areas, 1,000 - 3,000 in district councils, and fewer than 1,000 in some rural areas.[@statsnz2020] SA1 provides a finer look, to the order of 100-200 residents, and a maximum of 500 in any given area.[@statsnz2021] Doing so will allow increased insight into geographical anomalies and allow targeted interventions at communities experiencing reduced cancer care access, which will seek to correct these inequities, regardless of the composition of said population. The end goal would be to construct infrastructure allowing the map to be updated regularly thus continuously assessing the viability of community-based models of cancer care. Success in this novel way to target inequities would provide the platform for the initiative to be expanded to include services outside of cancer care, and be expanded to the national level.
+
+As a proof of concept, this study aims to trial geomapping and modelling using a coarser level of resolution at the Census Area Unit (CAU) level. CAUs predate SAs and were used in New Zealand censuses until 2013. CAUs aggregate neighbouring statistical meshblocks and contain a highly variable population of individuals, from single digits to upwards of 5,000 individuals.[@statsnz2016]
+
+## Methods
+
+### Data Acquisition
+
+Northland data for this study was acquired through the Management Support Service (MSS) in conjunction with Te Poutokomanawa - The Māori Health Directorate of Northland DHB (prior to 1 July 2022). The data warehouse contains information from the (former) Northern Region Health Coordination Centre (NRHCC) which involved the four northernmost DHBs in Aotearoa: Northland, Waitematā, Auckland, and Counties Manukau. The DHB system has been dissolved on 1 July 2022 with the formation of Te Whatu Ora/Health NZ; this organisational restructuring does not affect data collections within NRHCC, no labelled as the Northern Region of HNZ.
+
+The data regarding cancer care was collected from the Faster Cancer Treatment (FCT) pathway for this pilot study. This includes patients with cancer diagnoses that did not qualify for fast tracked care, thus providing a reasonably accurate snapshot of cancer care in Northland. Patient data is entered into the Regional Clinical Portal (RCP), a system shared between the four DHBs of NRHCC. Clinicians have access to RCP, and can input their own data. Further data is added from in-patient records, operating theatres, laboratory tests, radiological investigations, and other extensions of clinical practice. Not all primary care patients enter the data warehouse. Mahitahi Hauora, Northland's foremost Primary Health Entity (PHE) formerly encompassed all primary practices (including GPs, medical centres, and Māori Health Providers), but some practices have withdrawn from PHE, resulting in some new data not being captured. FCT data is added as patients join the pathway, with direct admissions to the Emergency Department (ED) resulting in incomplete referral data. In future efforts, a more comprehensive database will be utilised to combat generate a complete picture. Hospital data is regularly sent to the Ministry of Health (MoH) for inclusion in national databases and duplicates are removed regularly.
+
+National Health Index (NHI) numbers are unique six digit alphanumeric codes assigned to every individual in Aotearoa. For confidentiality reasons, MSS provided researchers with data whose NHIs had been locally encrypted, so identification and bias are reduced.
+
+The dataset used in the following analysis contains all patients from the last ten years (2013 - 2022) whose data had been collected to 30 June 2022. Patient data can contain missing values in variable columns, but contain 100% completion in pertinent descriptors, such as date of birth, ethnicity, tumour stream, etc. CAU domicile codes are present for all patients. Although StatsNZ now uses geographical divisions of SA1/SA2 resolution, CAU populations were more readily available. These population figures were obtained from StatsNZ, via Figure.NZ.[@statsnz2014] A total of 17,919 raw data points are included in analysis.
+
+Ultimately, the sovereignty over the data resides in the communities from which is draws. Therefore Puehu Tuarangi incorporates a kaitiakitanga (guardianship) structure for Data Sovereignty according to principles of [Mana Raraunga](https://www.temanararaunga.maori.nz/tutohinga). Data is tāonga (culturally significant object) and was thus treated as such with utmost respect in this study.
+
+Health and Disability Ethics Committees (HDEC) approval was not required for this proof of concept. There were no direct interactions with patients or whānau. All patient data that was used was anonymised and encrypted, thus researchers and the public would not be able to identify the individuals' whose data has been utilised. At no point was identifiable data used. The results published are purely statistical, and culminate in a graphical form, thus the public viewing the outcomes will not have any access to discrete data sets. This study was conducted in line with guidelines published by the MoH, consistent with the Official Information Act 1982, Privacy Act 2020, and Health Information Privacy Code 2020.
+
+### Statistical Analysis
+
+Raw data has undergone preliminary cleaning before implementing statistical analytic coding. The data has been narrowed to only the CAUs that fall within Northland DHB, eliminating all data from the other 3 DHBs comprising NRHCC and from patients with recorded residence elsewhere in NZ: i.e. south of (and including) Wellsford (CAU Domicile code: 505300). This dataset further excluded all skin cancers, as many are managed by services outside of oncology such as general practice and surgical care; hence they are not a good indication of cancer care service utilisation, aside from melanoma which can require systemic therapy and oncologist input.[@ryder2017; @neville2007] Records with duplicate encrypted IDs were also removed, generally keeping only the most recent one. This resulted in a final number of 13,243 individuals' unit records included in the statistical analysis. One data point coded to the invalid CAU code 501805 had the text descriptor "Bream Head" so was recoded to the domicile code for that area, 501815.
+
+Two variables were chosen to measure performance in this study. Surgery and lag time between first specialist assessment (FSA) and decision-to-treat (DTT) date are used as proxy indicators of access to cancer care. Surgery was chosen as it is used across different tumour streams as a curative or palliative procedure. Only select cancer locations are amenable to excision by surgery, such as bowel, breast, prostate, ovarian, etc.; nevertheless rates should theoretically be equivalent across regions if equitable access and outcomes are achieved. Inherently, surgery is also a measure of level of access to care. Surgical services require larger centres and impose access and utilisation barriers upon populations with inequities. This may manifest in disparities in health outcomes.[@sullivan2015] A published example of such surgery is used as an indicator for inequities between ethnicities in treatment of prostate, lung, colon, and other cancers where surgical intervention is indicated.[@zavala2021] Selection of a definitive outcome such as surgery also allows rapid data processing. All patients were assigned a binary code for Surgery/NotSurgery, returning either TRUE or FALSE, with missing data points or NULL values also returning FALSE. This produced a robust indicator in which there were no missing data points in the 13,243 patients' records used. This rapid processing also provides future advantages for keeping Puehu Tuarangi's mapping tool up-to-date.
+
+Lag time between FSA and DTT is another indicator chosen to analyse performance. First specialist assessment (FSA) is defined as where patients come in to contact with oncology services or other members of the multi-disciplinary team, such as surgical services, representing the patients transition to specialist care.[@ministryofhealth2019] Date of decision-to-treat (DTT) is defined by the MoH as "the date when the decision was made for the patient's treatment plan or other management plan, following discussion between the patient and the clinician responsible for treatment."[@ministryofhealthcancerservices2014]^(p.5)^ The DTT is a mandatory part of FCT data collection and thus provides a robust data set from which to draw. The lag time is defined as the number of days between FSA and recorded DTT. Missing dates in either column returns NULL and corresponding patient data is removed, resulting in a total of 1,991 patients removed. Those with lag times under 0 (i.e.DTT occurred before FSA) and over two years/730 days are considered outliers and were also removed for analysis, separate from surgical outcome analysis. This removed 15 and 849 cases respectively, resulting in a total of 12,349 cases included. Cases were defined binary as whether or not lag times were under 31 days, returning TRUE and FALSE. A higher proportion of lag times under the 31 day cut off is deemed as better performance. This value aligns with MoH's FCT 31 day indicator, which is the target for DDT to first treatment for cancer.[@ministryofhealthcancerservices2014] The lag times between FSA and DTT were chosen instead of the FCT indicator as the dataset was more complete in our database, and can be used to evaluate discrepancies in timeliness in treatment between CAUs.
+
+Patients were grouped together by their corresponding CAUs of residence. Total counts of surgical interventions and cases with lag times under 31 days within CAUs were counted and then compared against total cases of cancer in each CAU, giving a ratio (displayed to four significant figures: Appendix 1) with which to gauge performance of any given CAU. In both cases, a lower number or ratio indicates poorer performance. Funnel plots with indirectly standardised ratios were generated with respective numerators to create a graphical representation of data to visually identify outliers. Funnel plots are generated with varying confidence intervals, allowing data to be analysed and benchmarked according to either 95% or 98% confidence intervals and overdispersion. Linear regression is calculated according to Poisson distribution, which predicted amount of surgeries or cases with lag times under 31 days for a given number of cases in CAUs.
+
+```{r echo=FALSE, error=FALSE, fig.keep='all', message=FALSE, warning=FALSE, results='hide'}
+# National Census Area Map
+# Source is https://datafinder.stats.govt.nz/layer/25743-area-unit-2013/ 
+CAmap <- read_sf("./area-unit-2013.csv")
+
+# Census Area map for Te Tai Tokerau 
+TTmap  <- subset(CAmap,AU2013_V1_00 < 505300)
+
+TTmap$MapIndex         <- match(TTmap$AU2013_V1_00,FinalTable$CAU)
+TTmap$SurgCaseRatio    <- FinalTable$SurgCaseRatio[TTmap$MapIndex] 
+TTmap$LagCaseRatio     <- FinalTable$LagCaseRatio [TTmap$MapIndex]
+TTmap$Cases            <- FinalTable$Cases[TTmap$MapIndex] 
+TTmap$Populations      <- FinalTable$Residents[TTmap$MapIndex]
+
+tmap_options(fontfamily = "Calibri", bg.color = "black", legend.text.color = "white", 
+             legend.title.color = "white", title.color = "white")
+
+Maps$tt1  <- tm_shape(TTmap) + tm_polygons() + tm_layout(title = "Northland CAUs", title.position = c("right","top"))
+
+Maps$Cases_carto = cartogram_cont(TTmap, "Cases", itermax = 5)
+Maps$ca1        <- tm_shape(Maps$Cases_carto) + 
+                   tm_polygons("Cases") + tm_layout(title = "Cases by CAU", title.position = c("right","top"))
+
+Maps$Populations_carto = cartogram_cont(TTmap, "Populations", itermax = 5)
+Maps$ca2 <- tm_shape(Maps$Populations_carto) +
+            tm_polygons("Populations") + tm_layout(title = "Residents by CAU", title.position = c("right","top"))
+
+```
+
+Mapping resources were obtained from StatsNZ to generate maps and cartogram graphics. Mapping data was subset to align with patient data, removing all points with the CAU over 505300, thus excluding all areas south of Northland.[@statsnz2016] Cartograms were generated by warping geographical areas based on the number of cancer cases within a given CAU, making smaller and denser CAUs more visible on the mapping. Performance data from each CAU was assigned to geographical CAUs on mapping with colours assigned so poorer performing areas appear dimmer, akin to nebulae clouding the night sky.
+
+All statistical analyses and resulting visual output are achieved utilising R statistical software package version 4.2.1.[@rcoreteam2022] Main packages utilised were dplyr,[@dplyr] TMap,[@tmap] cartogram,[@cartogram] FunnelPlotR,[@FunnelPlotR] among others. Complete source code is available as a complete repository at [GitHub](https://github.com/mtan907/PuehuTaurangiPilot).
+
+## Results
+
+From 2012 to 2022, a total of 15,338 cases of cancer were recorded in Northland DHB as a part of the FCT database, excluding skin cancers. Of these cases, 13,243 were identified as unique cases residing within Northland. This approximates to a rate of \~1324 new cases per year. Demographically, the reporting population is predominantly female and non-Māori. Nationally, cancer incidence is similar between males and females. As mentioned earlier, Northland has a relatively high proportion of Māori as usual residents (approximately 36%).[@statsnz2018]
+
++----------------------------------------------------------------+---------------+
+| *Table 1.* Demographics of cancer cases in Northland 2013-2022 | Number (%)    |
++================================================================+===============+
+| Total cases of non-skin cancer                                 | 15,338        |
++----------------------------------------------------------------+---------------+
+| -   Male                                                       | 6,671 (43.5)  |
++----------------------------------------------------------------+---------------+
+| -   Female                                                     | 8,667 (56.5)  |
++----------------------------------------------------------------+---------------+
+| Ethnicity                                                      |               |
++----------------------------------------------------------------+---------------+
+| -   Māori                                                      | 4,060 (26.5)  |
++----------------------------------------------------------------+---------------+
+| -   Non-Māori                                                  | 11,278 (73.5) |
++----------------------------------------------------------------+---------------+
+| Cases by year                                                  |               |
++----------------------------------------------------------------+---------------+
+| -   Before 2013 (excluded from analysis)                       | 2             |
++----------------------------------------------------------------+---------------+
+| -   2013                                                       | 338           |
++----------------------------------------------------------------+---------------+
+| -   2014                                                       | 639           |
++----------------------------------------------------------------+---------------+
+| -   2015                                                       | 740           |
++----------------------------------------------------------------+---------------+
+| -   2016                                                       | 1,137         |
++----------------------------------------------------------------+---------------+
+| -   2017                                                       | 1,678         |
++----------------------------------------------------------------+---------------+
+| -   2018                                                       | 1,909         |
++----------------------------------------------------------------+---------------+
+| -   2019                                                       | 1,781         |
++----------------------------------------------------------------+---------------+
+| -   2020                                                       | 2,010         |
++----------------------------------------------------------------+---------------+
+| -   2021                                                       | 2,428         |
++----------------------------------------------------------------+---------------+
+| -   2022 (to 1 July)                                           | 1,216         |
++----------------------------------------------------------------+---------------+
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, error=FALSE, fig.align='center', dpi=150, fig.width=10, fig.height=5, fig.cap = "Figure 1. Baseline maps of Northland displaying Census Area Unit borders, and subsequent cartogram iterations with geography warped corresponding to cancer cases and residents."}
+tmap_arrange(Maps$tt1,Maps$ca1,Maps$ca2)
+```
+
+Geographical analysis was conducted to the CAU level, as defined by the 2013 census dataset. Anecdotally, CAU populations can vary significantly, depending on population density and rurality of locations. Within the Northland CAUs analysed, populations ranged from 39 in Port-Limeburners/503900 (next smallest - Kohukohu/500500: 165), to 6507 residents in Kerikeri/500900 (next largest - Rehia-Oneriri/505010: 5418). Expectedly, this resulted in a large range of cancer cases reported, from 8 in the smallest CAU, to 744 in Kerikeri. Geographically smaller CAU locales are typically more densely populated, therefore contiguous cartograms using both quantity of cases and populations are created to more easily visualise denser populated areas (Figure 1). Contiguous cartograms increase the geometric size of CAUs in relation to population density, whilst maintaining overall geometry of Northland (as opposed to non-contiguous, in which warped intentionally do not share borders). Despite being generated with two different variables, the population and case cartograms bear visual resemblance, and thus represents the positive relationship between population and cases of cancer from a purely visual perspective. I.e. the more people in a CAU, the more cases of cancer one would expect. To more accurately calculate and display indicators of performance, cases were used as the denominator. Cases of cancer per CAU ranged from 8 (Port-Limeburners) to 744 (Kerikeri).
+
+```{r echo=FALSE, error=FALSE, fig.height=5, fig.keep='all', fig.width=8, message=FALSE, warning=FALSE, dpi=150, results='hide', fig.cap = "Figure 2. Funnel Plot generated on surgical rates in given Census Area Units."}
+# Surgery Funnel plot
+Plots$SurgFunPlot <- (function(x = FinalTable) {
+  
+  x$Domicile     <- factor(x$Domicile)
+  x$Surgery      <- as.numeric(x$Surgery)
+  
+  Anchor         <- glm(Surgery ~ Cases , 
+                        family="poisson", 
+                        data=x)
+  
+  Predicted      <- predict(Anchor, newdata = x, type="response")
+  
+  
+  # Draw plot, returning just the plot object
+  funnel_plot(denominator=Predicted, numerator=x$Surgery,
+              limit=95 , group = x$Domicile, label = "outlier",
+              draw_unadjusted = TRUE, title = "Surgery by CAU Funnel Plot", 
+              x_label = "Cases")
+  
+})()
+
+Plots$SurgFunPlot
+```
+
+Two funnel plots were generated to provide a graphical representation of performance data. Although typically used in meta-analyses to display outliers and publication bias, funnel plots can be a tool utilised to quickly identify outlying data points that are beyond the scope of expected variation. The y-axis represents an indirectly standardised ratio (SR) calculated using our dataset, that predicts the amount of surgery or lag times under 31 days given case load of any CAU, with 95%/99.8% confidence intervals and overdispersion lines for identifying outliers. Those who fall above the SR line of 1.0 have more surgeries or lag times under 31 days cases than predicted at given case load (positive indicator), whereas those below have fewer (negative indicator).
+
+Figure 2 displays surgery rates by cases. Several CAUs fall below the lower 99.8% overdispersion line interval including Port-Limeburners recording zero surgical interventions, as well as Kohukohu, Western Hills, and Kerikeri. A further eight CAUs are outside the 95% lower overdispersion line. No CAUs recorded surgical rates above the upper 99.8% confidence interval and overdispersion line, however, Tikipunga East and Kamo East fall above the 95% overdispersion line, indicating outlier positive performance.
+
+```{r echo=FALSE, results='hide', fig.keep='all', warning=FALSE, message=FALSE, error=FALSE, dpi=150, fig.width = 8, fig.height= 5, fig.cap = "Figure 3. Funnel Plot generated on rates of cases with lag times under 31 days in given Census Area Units."}
+#Funnel plot for Lags Under 31 count
+
+Plots$LagFunPlot <- (function(x=FinalTable) {
+  
+  x$Domicile        <- factor(x$Domicile)
+  x$LagUnder31       <- as.numeric(x$LagUnder31)
+  
+  Anchor         <- glm(LagUnder31 ~ Cases, 
+                        family="poisson", 
+                        data=x)
+  
+  Predicted      <- predict(Anchor, newdata = x, type="response")
+  
+  
+  # Draw plot, returning just the plot object
+  funnel_plot(denominator=Predicted, numerator=x$LagUnder31,
+              limit=95 , group = x$Domicile, label = "outlier",
+              draw_unadjusted = TRUE, title = "Lag Time Under 31 days by CAU", 
+              x_label = "Expected Cases")
+})()
+
+Plots$LagFunPlot
+```
+
+The funnel plot generated on quantity of cases with lag times under 31 days displays a similar graphical story, with many of the same CAUs displaying poor performance as defined by the lag time variable too (Figure 3). The three poorest performers are the same in both, Port-Limeburners, Western Hills, and Kohukohu. Of note, the lag time funnel plot features a total of nine points overdispersed below the 99.8% lower overdispersion limit. However, more CAUs are overdispersed below this line too, including Awanui, Opua East, Abbey Caves, Ruawai, Kaiwaka, and North Cape. A further six CAUs fall below the 95% overdispersion line, including Kerikeri. This indicates that these CAUs have fewer cases with lag times under 31 days than predicted, indicating poor performance.
+
+Geomapping paints a different visual representation of data. Jenks natural breaks optimisation has been used to split performance into discrete groups visualisation which minimises deviation from the average within the group, and maximises differences between group. The subsequent choropleths generated (Figure 4 and 5) are matched to colour palettes resulting in dark blue equating to poorer performance, and yellow equating to greater performance. Ratio between surgery or lag cases under 31 against cases of cancer is plotted on this map, and has not been adjusted to follow a linear regression model.
+
+```{r echo=FALSE, results='hide', fig.keep='all', warning=FALSE, message=FALSE, error=FALSE}
+Maps$pe1 <- tm_shape(TTmap) + 
+  tm_polygons("SurgCaseRatio", palette = "cividis", n = 6, style = "jenks", border.col = "black") +
+  tm_layout(title = "A) Surgical Rate by CAU", title.position = c("right","top"))
+  
+
+Maps$pe2 <- tm_shape(Maps$Cases_carto) +
+  tm_polygons("SurgCaseRatio", palette = "cividis", n = 6, style = "jenks", border.col = "black") +
+  tm_layout(title = "B) Surgical Rate on Cases Cartogram", title.position = c("right","top")) + 
+  tm_shape(Maps$Cases_carto %>%
+             filter(AU2013_V1_00_NAME %in% c("Kerikeri","Awanui","Port-Limeburners"))) +
+  tm_borders(col = "red") +
+  tm_text("AU2013_V1_00_NAME", col = "white", xmod = 2.5, ymod = 1)
+
+Maps$pe3 <- tm_shape(TTmap) +
+  tm_polygons("LagCaseRatio", palette = "cividis", n = 6, style = "jenks", border.col = "black") +
+  tm_layout(title = "A) Lag Times Rate by CAU", title.position = c("right","top"))
+
+
+Maps$pe4 <- tm_shape(Maps$Cases_carto) +
+  tm_polygons("LagCaseRatio", palette = "cividis", n = 6, style = "jenks", border.col = "black") +
+  tm_layout(title = "B) Lag Times on Cases Cartogram", title.position = c("right","top")) +
+  tm_shape(Maps$Cases_carto %>%
+             filter(AU2013_V1_00_NAME %in% c("Kerikeri", "Awanui", "Port-Limeburners"))) +
+  tm_borders(col = "red") +
+  tm_text("AU2013_V1_00_NAME", col = "white", xmod = 2.5, ymod = 1)
+
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, error=FALSE, dpi=150, fig.cap = "Figure 4. Surgical Rates choropleth (A) and surgical rates plotted on warped cases cartogram (B) in order to display smaller CAUs with dense populations."}
+tmap_arrange(Maps$pe1,Maps$pe2, nrow = 1)
+
+```
+
+The surgical maps highlight the six poorest performing CAUs in brighter yellow as seen in Figure 4. These include Port-Limeburners (zero surgeries), followed by Russell, Pataua-Whareora, Ohaeawai, Kohukohu, and Springs Flat, which represent the lowest rates of surgical interventions for cancer in the region. A further 20 CAUs reside in the next poorest performing category, highlighted as a duller yellow.
+
+```{r echo=FALSE, error=FALSE, message=FALSE, warning=FALSE, dpi=150, fig.cap = "Figure 5. Rates of cases with lag times under 31 days by CAU choropleth (A) and lag time rates plotted on warped cases cartogram (B) in order to display smaller CAUs with dense populations."}
+
+tmap_arrange(Maps$pe3,Maps$pe4, nrow = 1)
+
+```
+
+The lag time mapping highlights poor performance in different CAUs than surgical geomaps, seen in Figure 45 The five poorest performing are highlighted as such: Western Hills, Moerewa, Ruawai, Kaiwaka, and Riverside. These areas have the high proportion of cases with lag times over 31 days, displaying a larger delay in treatment compared to well performing areas highlighted in blue.
+
+The "missing" area seen in Figure 4 represents the Bay of Islands. According to the 2013 census, this area is exclusively water and contains no land area, and has a population of six usual residents (see base R code population table).[@statsnz2016] No cases of cancer were recorded in this (likely transient) population, and therefore it was removed from analysis.
+
+For full data tables, refer to Appendix 1.
+
+## Discussion
+
+During the recent and ongoing health systems restructuring in New Zealand, equity in healthcare has once again been brought into the limelight. Health New Zealand and the Māori Health Authority have are recognising the multitude of short-comings in Aotearoa's universal health system. Puehu Tuarangi looks to be a tool that can be used both in identifying and addressing said shortcomings at varying levels of geographical resolution, an asset at all levels of systemic change from clinician to policy maker. Typically, cancer care performance studies in New Zealand have been conducted on a DHB or national level. This is one of the first studies exploring the use of geomapping cancer care in New Zealand to a resolution potentially as fine as communities.
+
+Northland continues to suffer higher rates of cancer compared to national averages. In the most recent reported cancer statistics released by the Ministry of Health (2019) the national rate was approximately 340.3 per 100,000. According to our database, 2019 saw 1781 new diagnoses of cancer in Northland (Table 1), which equates to a rate of approximately 914.7 new cases per 100,000, i.e., higher than the national rate that year.[@ministryofhealth2021] Furthermore, in line with Northland's higher proportion of Māori, a higher proportion of Māori were diagnosed with cancer in Northland, which is \~26.5% (Table 1) over the last ten years, compared to a national average of \~11.2% released by the Ministry of Health in 2019.[@statsnz2018; @ministryofhealth2021]
+
+There are ongoing attempts to improve cancer care equity in New Zealand. Schemes such as the Faster Cancer Treatment pathway aim to hasten cancer care across the board. Although Northland is improving in regards to meeting targets, serial audits in gynaecological cancers and the FCT pathway show that Northland continues to fall below the national average and the benchmarks set by the Ministry of Health.[@cherry2022] Across the board, from investigation, to First Specialist Assessment, treatment falls short of addressing the ongoing inequities within the oncology niche of the health sector. Within these audits, access barriers such as geography, rurality, and ethnicity are also highlighted. Haynes et al. (2008), describe how limitations in geographical accessibility seem to affect different tumour streams adversely according to varying indicators, but also seem to unify trends in distance from cancer care to global cancer outcomes (with gastrointestinal cancers showing a paradoxical bell-curve like relationship between distance and mortality).[@haynes2008] By contrast, some studies including those on breast cancer diagnosis and survival, or colorectal cancer treatment delay in Northland, show little to no statistically significant difference related to rurality or ethnicity; indeed studies such as those on prostate cancer display a negative relationship between incidence and rurality, which may be an artefact of better access and over-detection.[@lao2020; @bennett2007; @obertova2012; @matthews2021]
+
+As a pilot study, Puehu Tuarangi has already highlighted unequal performance across discrete geographical subsets within the region. The maps generated by our study allows for these geographical relationships to be explored at a finer level, without relying on broader level inference of relationships between variables. The method highlights specifically poorly performing regions, regardless of their ethnic make-up and urban land area status, removing bias and preconceived notions from analysis as well.
+
+Multiple CAUs in Northland have been identified in our analysis as poorly performing. Throughout the funnel plots generated multiple recurring CAUs were overdispersed along the lower cut-off, indicating outlier status outside of normal expected variance (i.e. fewer surgical cases or lag times under 31 days than expected - poorer performance). Of these CAUs (listed in the results section and on Figure 2 and 3), the majority had total populations fewer than 500 residents, and fewer than 50 cases of cancer over the ten year period (Appendix 1). Not only could this introduce issues with privacy, but also impacts statistical analyses. Proportionally, each individual cancer case will have a larger impact on the perceived performance of the CAU, which limits extrapolation on actual cancer care access within the CAU over this period. This may also be an issue when moving on to finer geographical resolutions, such as SA1 and SA2, as they will contain smaller case numbers.[@statsnz2020; @statsnz2021]
+
+An example of this is the poorest performing CAU across the surgical dimension, Port-Limeburners, which presents the most extreme scenario within our analysis. With only eight recorded cases of cancer over the last ten years, no cancer surgery was performed over this time, leading to it being highlighted as an area of reduced access (Figure 4B and 5B). It is difficult to infer the cause of this reduced surgical rate, as the cancers represented in this area may have not been amenable to surgery. As a positive, analysing multiple variables has allowed us to view performance on different dimensions. Using our lag time indicator, Port-Limeburners performs closer to the area average, possibly indicating that timely cancer care exists for the small population. However, it may be as fallacious to draw positive conclusions as well as negative from a small number of cases recorded.[@bennett2007; @matthews2021]
+
+Contiguous cartograms provide an effective solution to this. By changing the dimensions of CAUs in proportion to their population or number of cancer cases, more visual weight is placed on larger CAUs whilst maintaining the overall aesthetic of the Northland region. However, contiguous cartograms do sacrifice some statistical accuracy for ease of locating and recognising areas of variance, which is preferred in our task.[@nusrat2018] Conversely, using gross mapping tools also inherently places more bias on larger geographical areas, in spite of using cartogram warping. Furthermore, gross mapping on this scale also makes interpreting data from more densely populated regions more difficult to read and interpret, hence our use of adjunct methods (funnel plots) to display information alongside the geomaps.
+
+From initial investigation, many of the CAUs appear to reside on opposite ends of the spectrum in regards to our performance indicators. This begs the question regarding the existence of confounding, where perhaps surgery impacts lag times between treatment decisions and vice versa. Mapping highlights further interesting quirks of cancer care in Northland. Most central urban CAUs within Whangārei, where Whangārei Base Hospital and Jim Carney Cancer centre (the base for Northland cancer treatment) exist, occupy the middle range of both performance indicators (Appendix 2). There are some exceptions, such as Western Hills (a western suburb of the city) which displays poor surgical and lag time performance, albeit with a small quantity of cancer cases. This implies that although rurality may affect care, that does not necessitate outright positive performance in urban centres, which aligns with some of the aforementioned studies on health services in Northland.[@matthews2021; @bennett2007]
+
+Kerikeri presents an interesting analytical challenge at the opposite end of the spectrum. The resident population of the CAU is higher than any other, containing 6,507 residents (mean CAU size = 1,805 individuals); this results in placing it further right on the x-axis of the funnel plots, and increased size in the subsequent cartograms generated with both populations and cases (Figure 4B and 5B). As a result of a large population, Kerikeri also displays a greater number of cases of cancer which could possibly skew analysis generated by the rest of coding. However, according to linear regression performed on generating predicted case numbers based on residents of every CAU (Appendix 3) shows that the large CAU does not fall outside of expected variance as analysis generates an R value of 0.9369, with Kerikeri residing above the average line. This confirms that analysis generated on Kerikeri can be viewed as valid, and the area's overdispersion on both surgical and lag time funnel plots can be analysed as such. However, using such larger populations highlights shortcomings of geographical studies with larger populations, as it overly generalises performances of a larger group of individuals, whereas Puehu Tuarangi seeks to refine this aspect of academic geographic analysis.
+
+Conversely, our analysis also allows us to make inferences on positive performance. The maps generated also allow easy recognition of CAUs and geographical areas displaying positive performance. Inferences could be made about points of difference in cancer care and access within these CAUs and possibly extrapolated to be implemented by other communities within the region, which provides a relevant blueprint from which to build policy. An example of this is Awanui, a geographically small and lightly populated CAU in the Northern end of the region (Figure 4B and 5B) which boasts the highest surgical rates and third highest lag time under 31 days ratio (Appendix 1). Although it is in close proximity to Kaitaia hospital, one of Northland's tertiary care centres, it outperforms CAUs that are closer to the hospital, including Kaitaia East and West CAUs themselves. This suggests that there are other factors impacting care in Awanui, and could prove to be useful in improving performance around the region.
+
+Cancer rates have also been used as a proxy measure for primary care accessibility. A past study used cancer alongside other variables in spatial analyses to identify correlations between healthcare/health outcomes and deprivation across Waikato DHB. Although cancer rate was the only selected variable not linked directly with NZ Deprivation level, this data still provided valuable information on relationships with disease burden relating to age and mortality.[@whitehead2022] With a more robust dataset such as ours and differing analytical perspectives, it shows the viability of such geographical analyses of health and how it can span across domains, a positive reinforcement for a long-term goal of Puehu Tuarangi to expand to other services.
+
+Ultimately, the change and push for equity envisioned by Puehu Tuarangi is predicated on policy level implementation of intervention. Studies prove that the use of cartograms/choropleths in conjunction with funnel plots allows for easy data readability and recognition of outliers by those with a varying background of statistical education, from physicians and biologists, to statisticians.[@mazzucco2019][@khoshabi2016] A role for collaborative efforts has also been shown in other geomapping efforts globally, which may facilitate clinicians and centres entering their own data into a wider database to analyse performances of their respective areas in a dynamic and up-to-date fashion.[@ku2019] Evidence for public access to such data is also indicated by some, which may push policy makers to further changes as it encourages those communities to also advocate for the performance of their communities, empowering patients and clinicians equally.[@khoshabi2016]
+
+## Conclusion
+
+Geomapping is a valuable asset in analysing areas of poor performance in cancer care throughout Northland. In this pilot study, we succeeded in generating several choropleths and cartograms of cancer care performance in the Northland region based on different indicators of access, including lag times and surgical rates. These maps were built to resemble "Puehu Tuarangi", or nebulae, the study's name origin. In doing so, geographical area units of Northland were recognised as having comparatively worse performance than others. Although methods and analysis are far from perfect, this study provides a suitable launching point from which to further develop and refine geomapping with the end goal of utilising this as an analytical tool for a wide audience.
+
+## Limitations and Next Steps
+
+This study was conducted using a limited dataset that was collected by the FCT process for administrative processes. The quality of this dataset and the completeness of data points within the set may have had an effect on analyses. The variables chosen as a proxy measure of performance were also possibly not as robust as could be, but due to incompleteness of data it was difficult to define other indicators, although binary definitions allowed for more straightforward analysis. The CAUs and their subsequent populations used in this analysis also present some issues regarding analyses. The varied population sizes resulted in some analytical challenges, and made predictions more difficult. Furthermore, the very small size of some CAUs may impact the privacy of residing patients. Using SA1 and SA2 in future analyses may present similar challenges; although the fine resolution allows visualisation of smaller communities, this could impact on the privacy of individual patients, and makes tracking performance variables more difficult.
+
+This pilot has achieved it's goal of providing a plausibility result in regards to executing and creating mapping of cancer care in Northland DHB. The next steps in this project are substantial. The R statistical software package allows for the creation of interactive mapping tools, which could open the door to many opportunities. This could include the changing of variables to measure performance via different indicators (including standardised versus unstandardised data), changing resolutions between SA1, SA2, and even larger geographical units, and ultimately allows new data to be added so a response and change in performance can be seen in an up-to-date fashion. Interactivity allows for temporal associations to be mapped as well. A potential future study could be conducted as a retrospective mapping of the effect of past interventions on cancer care on a geographical level. Incidence and performance can be mapped over a unit of time and geographically in order to track effectiveness of given policies. Ultimately, this would culminate in utilising the tool to track the effect that a targeted intervention or policy change would have on the poorer performing areas, allowing patients most in need to access the appropriate care.
+
+### Acknowledgements
+
+Thank you to the University of Auckland for facilitating this research. In particular, thank you to Associate Professor Chris Bullen for his administration, Dr George Laking and Dr Rob McNeill for their direct supervision and assistance with R coding and statistical methods respectively. Further thanks to Dr Yahp Jasperse and Eric Riddle of the Northern Region of Health New Zealand for their editorial expertise and data acquisition respectively.
+
+### Conflicts of Interest
+
+There are no conflicts of interest.
+
+\newpage
+
+## References
+
+::: {#refs}
+:::
+
+\newpage
+
+## Appendix
+
+```{r echo=FALSE}
+kable(FinalTable, caption = "Appendix 1. Calculated Data by CAU", digit = 4)
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, error=FALSE, dpi=150, fig.cap = "Appendix 2.Northland Maps with areas around Whangarei city highlighted."}
+Maps$pe5 <- tm_shape(Maps$Cases_carto) +
+  tm_polygons("SurgCaseRatio", palette = "cividis", n = 6, style = "jenks", border.col = "black") +
+  tm_layout(title = "Surgical Rate on Cases Cartogram", title.position = c("right","top")) + 
+  tm_shape(Maps$Cases_carto %>%
+             filter(AU2013_V1_00 %in% c("502001", "502002", "502003", "502004", "502005", "502101", 
+                                        "502201", "502202", "502300", "502400", "502500", "502600", "502700", 
+                                        "502800", "502900", "503000", "503100", "503200", "503300", "503400", 
+                                        "503500", "503600", "503700", "503800", "503900", "504000", "504100"))) +
+  tm_borders(col = "red")
+
+Maps$pe6 <- tm_shape(Maps$Cases_carto) +
+  tm_polygons("LagCaseRatio", palette = "cividis", n = 6, style = "jenks", border.col = "black") +
+  tm_layout(title = "Lag Times on Cases Cartogram", title.position = c("right","top")) +
+  tm_shape(Maps$Cases_carto %>%
+             filter(AU2013_V1_00 %in% c("502001", "502002", "502003", "502004", "502005", "502101", 
+                                        "502201", "502202", "502300", "502400", "502500", "502600", "502700", 
+                                        "502800", "502900", "503000", "503100", "503200", "503300", "503400", 
+                                        "503500", "503600", "503700", "503800", "503900", "504000", "504100"))) +
+  tm_borders(col = "red")
+
+tmap_arrange(Maps$pe5,Maps$pe6)
+```
+
+```{r echo = FALSE, fig.keep = 'all', warning = FALSE, message=FALSE, dpi = 100, fig.cap = "Appendix 3. Population Linear Regression"}
+
+lmCases <-  lm(Cases ~ Residents, data = FinalTable)
+
+ggplot(FinalTable, aes(Residents,Cases)) +
+  geom_point() +
+  geom_smooth(method = 'lm')
+
+summary(lmCases)
+```
